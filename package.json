@@ -1,0 +1,36 @@
+{
+	"name": "emdash-auto-meta",
+	"version": "1.0.0",
+	"description": "Emdash CMS plugin that enables AI agents to assign taxonomy terms and set SEO metadata via the content:afterSave hook",
+	"type": "module",
+	"exports": {
+		".": "./src/index.ts"
+	},
+	"keywords": [
+		"emdash",
+		"emdash-plugin",
+		"cms",
+		"ai-agents",
+		"mcp",
+		"claude",
+		"taxonomy",
+		"seo",
+		"cloudflare-workers"
+	],
+	"author": "Marcus Bellamy-Shaw",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/marcusbellamyshaw-cell/emdash-auto-meta.git"
+	},
+	"bugs": {
+		"url": "https://github.com/marcusbellamyshaw-cell/emdash-auto-meta/issues"
+	},
+	"homepage": "https://github.com/marcusbellamyshaw-cell/emdash-auto-meta#readme",
+	"peerDependencies": {
+		"emdash": "^0.12.0"
+	},
+	"devDependencies": {
+		"emdash": "latest"
+	}
+}
