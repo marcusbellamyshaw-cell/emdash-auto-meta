@@ -1,6 +1,7 @@
 import { definePlugin, ulid } from "emdash";
 import type { PluginContext, PluginDescriptor, ResolvedPlugin } from "emdash";
 import { getDb } from "emdash/runtime";
+import Anthropic from "@anthropic-ai/sdk";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -78,6 +79,133 @@ interface Logger {
 	info(msg: string): void;
 	warn(msg: string): void;
 	error(msg: string): void;
+}
+
+// ─── Vision LLM: Alt Text + Figcaption Generation ────────────────────────────
+
+/**
+ * Fetch image bytes from a local Emdash media URL and convert to base64.
+ * Returns null on any failure so callers can fall back gracefully.
+ */
+async function fetchImageAsBase64(
+	imageUrl: string,
+	log: Logger,
+): Promise<{ base64: string; mediaType: "image/jpeg" | "image/png" | "image/gif" | "image/webp" } | null> {
+	try {
+		// Resolve relative URLs to the local Worker origin
+		const origin = typeof globalThis !== "undefined" && "location" in globalThis
+			? (globalThis as unknown as { location: { origin: string } }).location.origin
+			: "http://localhost:4321";
+		const fullUrl = imageUrl.startsWith("http") ? imageUrl : `${origin}${imageUrl}`;
+		const resp = await fetch(fullUrl);
+		if (!resp.ok) {
+			log.warn(`Vision fetch failed (${resp.status}): ${fullUrl}`);
+			return null;
+		}
+		const contentType = resp.headers.get("content-type") ?? "image/jpeg";
+		const mediaType = (
+			contentType.includes("png") ? "image/png" :
+			contentType.includes("gif") ? "image/gif" :
+			contentType.includes("webp") ? "image/webp" :
+			"image/jpeg"
+		) as "image/jpeg" | "image/png" | "image/gif" | "image/webp";
+		const arrayBuffer = await resp.arrayBuffer();
+		const bytes = new Uint8Array(arrayBuffer);
+		// Base64 encode
+		let binary = "";
+		for (let i = 0; i < bytes.byteLength; i++) {
+			binary += String.fromCharCode(bytes[i]);
+		}
+		const base64 = btoa(binary);
+		return { base64, mediaType };
+	} catch (err) {
+		log.warn(`Vision image fetch error: ${err}`);
+		return null;
+	}
+}
+
+export interface VisionAltResult {
+	altText: string;
+	figcaption: string;
+}
+
+/**
+ * Call the Anthropic Vision API to generate concise alt text and a
+ * brief figcaption for a hero image.
+ *
+ * Falls back gracefully (returns null) if:
+ * - ANTHROPIC_API_KEY is missing
+ * - The image cannot be fetched
+ * - The API call fails for any reason
+ */
+export async function generateImageMeta(
+	imageUrl: string,
+	articleTitle: string,
+	log: Logger,
+): Promise<VisionAltResult | null> {
+	const apiKey = (typeof process !== "undefined" && process.env?.ANTHROPIC_API_KEY) ??
+		(typeof globalThis !== "undefined" ? (globalThis as unknown as Record<string, string>)["ANTHROPIC_API_KEY"] : undefined);
+
+	if (!apiKey) {
+		log.warn("ANTHROPIC_API_KEY not set – skipping Vision alt text generation");
+		return null;
+	}
+
+	const imageData = await fetchImageAsBase64(imageUrl, log);
+	if (!imageData) return null;
+
+	try {
+		const client = new Anthropic({ apiKey });
+		const response = await client.messages.create({
+			model: "claude-sonnet-4-20250514",
+			max_tokens: 300,
+			messages: [
+				{
+					role: "user",
+					content: [
+						{
+							type: "image",
+							source: {
+								type: "base64",
+								media_type: imageData.mediaType,
+								data: imageData.base64,
+							},
+						},
+						{
+							type: "text",
+							text: `You are generating accessibility metadata for a Texas history article titled: "${articleTitle}".
+
+Analyze this image and respond with ONLY valid JSON in this exact format (no markdown, no preamble):
+{
+  "altText": "<concise description of what is physically depicted in the image, 10-20 words, no quotes>",
+  "figcaption": "<brief caption suitable for display below the image, 15-30 words, include date/location if visually apparent, credit 'Source unknown' if no credit is visible>"
+}
+
+Rules:
+- altText must NOT repeat the article title verbatim
+- altText must be descriptive of the image contents (people, place, objects, scene)
+- If the image is purely decorative or abstract, use altText: ""
+- figcaption should be specific to what is shown, written in present tense or as a caption noun phrase`,
+						},
+					],
+				},
+			],
+		});
+
+		const text = response.content.find((b) => b.type === "text")?.text ?? "";
+		// Strip any accidental markdown fences
+		const clean = text.replace(/```json|```/g, "").trim();
+		const parsed = JSON.parse(clean) as VisionAltResult;
+		if (typeof parsed.altText === "string" && typeof parsed.figcaption === "string") {
+			log.info(`Vision: alt="${parsed.altText.slice(0, 60)}"`);
+			return parsed;
+		}
+		log.warn("Vision: unexpected response shape");
+		return null;
+	} catch (err) {
+		log.warn(`Vision API error: ${err}`);
+		return null;
+	}
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -240,13 +368,41 @@ export function createPlugin(options: EmdashAutoMetaConfig = {}): ResolvedPlugin
 					const { meta, cleanedData } = extracted;
 					log.info(`Processing ${ev.collection}/${contentId}`);
 
-					// Build update payload: cleaned body + optional SEO
+					// ── Vision: generate alt text + figcaption for the hero image ──────
+					const featuredImage = contentData.featured_image as Record<string, unknown> | null | undefined;
+					const imageStorageKey =
+						(featuredImage?.meta as Record<string, unknown> | undefined)?.storageKey as string | undefined ??
+						(typeof featuredImage?.id === "string" ? featuredImage.id : undefined);
+					const imageUrl = imageStorageKey
+						? `/_emdash/api/media/file/${imageStorageKey}`
+						: (typeof featuredImage?.src === "string" ? featuredImage.src : undefined);
+
+					let visionResult: VisionAltResult | null = null;
+					if (imageUrl) {
+						const title = typeof contentData.title === "string" ? contentData.title : "";
+						visionResult = await generateImageMeta(imageUrl, title, log);
+					}
+
+					// Build update payload: cleaned body + optional SEO + Vision-generated image meta
 					const updatePayload: Record<string, unknown> = { ...cleanedData };
 					if (meta.seo_title || meta.seo_description) {
 						updatePayload["seo"] = {
 							title: meta.seo_title ?? "",
 							description: meta.seo_description ?? "",
 						};
+					}
+					// Patch hero image alt if Vision succeeded and image exists
+					if (visionResult && featuredImage && typeof featuredImage === "object") {
+						updatePayload["featured_image"] = {
+							...featuredImage,
+							alt: visionResult.altText,
+							// Store figcaption in a custom field if the schema supports it;
+							// otherwise it will be accessible via the alt field and plugin storage.
+							caption: visionResult.figcaption,
+						};
+						// Persist figcaption to plugin KV so themes can read it independently
+						await ctx.kv.set(`figcaption:${ev.collection}:${contentId}`, visionResult.figcaption);
+						log.info(`Vision figcaption stored for ${contentId}`);
 					}
 
 					// Strip the meta block (and set SEO) in a single content update

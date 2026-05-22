@@ -1,7 +1,7 @@
 {
 	"name": "emdash-auto-meta",
 	"version": "1.0.0",
-	"description": "Emdash CMS plugin that enables AI agents to assign taxonomy terms and set SEO metadata via the content:afterSave hook",
+	"description": "Emdash CMS plugin that enables AI agents to assign taxonomy terms and set SEO metadata via the content:afterSave hook. Includes Vision LLM for hero image alt text and figcaption generation.",
 	"type": "module",
 	"exports": {
 		".": "./src/index.ts"
@@ -15,7 +15,9 @@
 		"claude",
 		"taxonomy",
 		"seo",
-		"cloudflare-workers"
+		"cloudflare-workers",
+		"vision",
+		"accessibility"
 	],
 	"author": "Marcus Bellamy-Shaw",
 	"license": "MIT",
@@ -27,8 +29,11 @@
 		"url": "https://github.com/marcusbellamyshaw-cell/emdash-auto-meta/issues"
 	},
 	"homepage": "https://github.com/marcusbellamyshaw-cell/emdash-auto-meta#readme",
+	"dependencies": {
+		"@anthropic-ai/sdk": "^0.97.1"
+	},
 	"peerDependencies": {
-		"emdash": "^0.12.0"
+		"emdash": ">=0.12.0"
 	},
 	"devDependencies": {
 		"emdash": "latest"
