@@ -138,7 +138,7 @@ async function fetchImageAsBase64(
 	}
 }
 
-export interface VisionAltResult {
+interface VisionAltResult {
 	altText: string;
 	figcaption: string;
 }
