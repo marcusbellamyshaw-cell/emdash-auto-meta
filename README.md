@@ -165,6 +165,12 @@ This plugin was built as a workaround for two gaps in the Emdash MCP server. If 
 
 Bug reports and pull requests welcome. Please open an issue before submitting a PR for anything beyond a small bug fix.
 
+## About
+
+AI-assisted taxonomy and SEO metadata plugin for EmDash CMS. Designed by Marcus Shaw for [Every Bit Texas](https://everybittexas.com). Coded by [Claude Code](https://claude.ai/code).
+
+Built for [EmDash CMS](https://github.com/emdash-cms/emdash) — star the repo to support open-source CMS development.
+
 ## License
 
 MIT
