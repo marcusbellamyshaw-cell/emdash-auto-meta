@@ -2,5 +2,7 @@ node_modules
 dist
 *.tsbuildinfo
 package-lock.json
+pnpm-lock.yaml
+pnpm-workspace.yaml
 .env
 .env.*

@@ -13,6 +13,12 @@ export interface EmdashAutoMetaConfig {
 	/** Logging verbosity. Default: "info" */
 	logLevel?: "silent" | "info" | "debug";
 	/**
+	 * Auto-generate excerpt (meta description) via Claude when absent.
+	 * Generates a ≤157-char excerpt from the post title + opening paragraphs.
+	 * Default: true
+	 */
+	autoExcerpt?: boolean;
+	/**
 	 * Maps the fixed metadata block keys to the actual taxonomy names in your
 	 * Emdash schema. Use this when your site's taxonomies are named differently
 	 * from the defaults.
@@ -34,6 +40,7 @@ interface ResolvedConfig {
 	metaPattern: RegExp;
 	autoCreateTags: boolean;
 	logLevel: "silent" | "info" | "debug";
+	autoExcerpt: boolean;
 	taxonomyMap: {
 		categories: string;
 		tags: string;
@@ -50,6 +57,7 @@ function resolveConfig(config: EmdashAutoMetaConfig): ResolvedConfig {
 		metaPattern: new RegExp(`${escapedPrefix}(.+?) -->`),
 		autoCreateTags: config.autoCreateTags ?? true,
 		logLevel: config.logLevel ?? "info",
+		autoExcerpt: config.autoExcerpt ?? true,
 		taxonomyMap: {
 			categories: config.taxonomyMap?.categories ?? "category",
 			tags: config.taxonomyMap?.tags ?? "tag",
@@ -97,7 +105,13 @@ async function fetchImageAsBase64(
 			? (globalThis as unknown as { location: { origin: string } }).location.origin
 			: "http://localhost:4321";
 		const fullUrl = imageUrl.startsWith("http") ? imageUrl : `${origin}${imageUrl}`;
-		const resp = await fetch(fullUrl);
+		// 10-second timeout — the image may be fetched via a self-referential
+		// subrequest back through the Worker. An unbounded fetch could stall the
+		// content:afterSave hook for the full Cloudflare subrequest timeout.
+		const imgCtrl = new AbortController();
+		const imgTid = setTimeout(() => imgCtrl.abort(), 10_000);
+		const resp = await fetch(fullUrl, { signal: imgCtrl.signal })
+			.finally(() => clearTimeout(imgTid));
 		if (!resp.ok) {
 			log.warn(`Vision fetch failed (${resp.status}): ${fullUrl}`);
 			return null;
@@ -155,7 +169,10 @@ export async function generateImageMeta(
 	if (!imageData) return null;
 
 	try {
-		const client = new Anthropic({ apiKey });
+		// 25-second SDK-level timeout — prevents a slow Vision API response from
+		// stalling the content:afterSave hook indefinitely. The hook has
+		// errorPolicy:"continue" so a timeout just skips alt-text generation.
+		const client = new Anthropic({ apiKey, timeout: 25_000 });
 		const response = await client.messages.create({
 			model: "claude-sonnet-4-20250514",
 			max_tokens: 300,
@@ -208,7 +225,103 @@ Rules:
 	}
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Helpers & Auto Excerpt Generation ──────────────────────────────────────
+
+/**
+ * Extract plain text from Portable Text blocks, skipping headings.
+ * Returns at most `maxChars` characters from the opening paragraphs.
+ */
+function extractPlainText(content: unknown, maxChars = 600): string {
+	if (!Array.isArray(content)) return "";
+	const parts: string[] = [];
+	for (const block of content) {
+		if (!block || typeof block !== "object") continue;
+		const b = block as Record<string, unknown>;
+		if (b._type !== "block") continue;
+		const style = typeof b.style === "string" ? b.style : "normal";
+		if (style === "h1" || style === "h2" || style === "h3" || style === "h4") continue;
+		const children = b.children;
+		if (!Array.isArray(children)) continue;
+		const text = children
+			.filter((c): c is Record<string, unknown> => !!c && typeof c === "object")
+			.map((c) => (typeof c.text === "string" ? c.text : ""))
+			.join("");
+		if (text.trim()) {
+			parts.push(text.trim());
+			if (parts.join(" ").length >= maxChars) break;
+		}
+	}
+	return parts.join(" ").slice(0, maxChars);
+}
+
+/**
+ * Use Claude Haiku to generate a meta description (140–157 chars) from the
+ * post title and opening body text.
+ * Returns null on failure so callers can skip gracefully.
+ */
+async function generateAutoExcerpt(
+	title: string,
+	bodyText: string,
+	log: Logger,
+): Promise<string | null> {
+	const apiKey =
+		(typeof process !== "undefined" && process.env?.ANTHROPIC_API_KEY) ??
+		(typeof globalThis !== "undefined"
+			? (globalThis as unknown as Record<string, string>)["ANTHROPIC_API_KEY"]
+			: undefined);
+
+	if (!apiKey) {
+		log.warn("ANTHROPIC_API_KEY not set – skipping auto-excerpt generation");
+		return null;
+	}
+
+	try {
+		const client = new Anthropic({ apiKey, timeout: 20_000 });
+		const response = await client.messages.create({
+			model: "claude-haiku-4-5-20251001",
+			max_tokens: 120,
+			messages: [
+				{
+					role: "user",
+					content: `Write a meta description for this article. Requirements:
+- Between 140 and 157 characters total (count carefully before responding)
+- Plain text only, no quotes, no em dashes at the start
+- Enticing, specific, written in present tense
+- Do not start with the article title verbatim
+
+Article title: ${title}
+Article opening: ${bodyText.slice(0, 500)}
+
+Respond with ONLY the meta description text.`,
+				},
+			],
+		});
+
+		const text =
+			(response.content.find((b) => b.type === "text") as { type: "text"; text: string } | undefined)
+				?.text?.trim() ?? "";
+
+		if (text.length >= 100 && text.length <= 160) {
+			log.info(`Auto-excerpt generated (${text.length} chars)`);
+			return text;
+		}
+
+		// Trim to 157 if model went slightly over
+		if (text.length > 160) {
+			const trimmed = text.slice(0, 157).replace(/\s+\S*$/, "").trim();
+			if (trimmed.length >= 100) {
+				log.info(`Auto-excerpt trimmed to ${trimmed.length} chars`);
+				return trimmed;
+			}
+		}
+
+		log.warn(`Auto-excerpt rejected (${text.length} chars): "${text.slice(0, 60)}"`);
+		return null;
+	} catch (err) {
+		log.warn(`Auto-excerpt error: ${err}`);
+		return null;
+	}
+}
 
 function makeLogger(ctx: PluginContext, level: "silent" | "info" | "debug"): Logger {
 	const tag = "[emdash-auto-meta]";
@@ -362,89 +475,111 @@ export function createPlugin(options: EmdashAutoMetaConfig = {}): ResolvedPlugin
 					const contentData = content.data as Record<string, unknown> | null | undefined;
 					if (!contentId || !contentData) return;
 
+					type ContentUpdater = {
+						update: (col: string, id: string, data: Record<string, unknown>) => Promise<unknown>;
+					};
+					const updater = (ctx.content && "update" in ctx.content)
+						? ctx.content as unknown as ContentUpdater
+						: null;
+
+					// ── Path 1: Explicit <!-- ebt-meta: --> block ─────────────────────
 					const extracted = extractMeta(contentData, cfg.metaPattern);
-					if (!extracted) return;
+					if (extracted) {
+						const { meta, cleanedData } = extracted;
+						log.info(`Processing meta block: ${ev.collection}/${contentId}`);
 
-					const { meta, cleanedData } = extracted;
-					log.info(`Processing ${ev.collection}/${contentId}`);
+						// Vision: generate alt text + figcaption for the hero image
+						const featuredImage = contentData.featured_image as Record<string, unknown> | null | undefined;
+						const imageStorageKey =
+							(featuredImage?.meta as Record<string, unknown> | undefined)?.storageKey as string | undefined ??
+							(typeof featuredImage?.id === "string" ? featuredImage.id : undefined);
+						const imageUrl = imageStorageKey
+							? `/_emdash/api/media/file/${imageStorageKey}`
+							: (typeof featuredImage?.src === "string" ? featuredImage.src : undefined);
 
-					// ── Vision: generate alt text + figcaption for the hero image ──────
-					const featuredImage = contentData.featured_image as Record<string, unknown> | null | undefined;
-					const imageStorageKey =
-						(featuredImage?.meta as Record<string, unknown> | undefined)?.storageKey as string | undefined ??
-						(typeof featuredImage?.id === "string" ? featuredImage.id : undefined);
-					const imageUrl = imageStorageKey
-						? `/_emdash/api/media/file/${imageStorageKey}`
-						: (typeof featuredImage?.src === "string" ? featuredImage.src : undefined);
+						let visionResult: VisionAltResult | null = null;
+						if (imageUrl) {
+							const title = typeof contentData.title === "string" ? contentData.title : "";
+							visionResult = await generateImageMeta(imageUrl, title, log);
+						}
 
-					let visionResult: VisionAltResult | null = null;
-					if (imageUrl) {
-						const title = typeof contentData.title === "string" ? contentData.title : "";
-						visionResult = await generateImageMeta(imageUrl, title, log);
-					}
+						// Build update payload: cleaned body + optional SEO + Vision image meta
+						const updatePayload: Record<string, unknown> = { ...cleanedData };
+						if (meta.seo_title || meta.seo_description) {
+							updatePayload["seo"] = {
+								title: meta.seo_title ?? "",
+								description: meta.seo_description ?? "",
+							};
+						}
+						if (visionResult && featuredImage && typeof featuredImage === "object") {
+							updatePayload["featured_image"] = {
+								...featuredImage,
+								alt: visionResult.altText,
+								caption: visionResult.figcaption,
+							};
+							await ctx.kv.set(`figcaption:${ev.collection}:${contentId}`, visionResult.figcaption);
+							log.info(`Vision figcaption stored for ${contentId}`);
+						}
 
-					// Build update payload: cleaned body + optional SEO + Vision-generated image meta
-					const updatePayload: Record<string, unknown> = { ...cleanedData };
-					if (meta.seo_title || meta.seo_description) {
-						updatePayload["seo"] = {
-							title: meta.seo_title ?? "",
-							description: meta.seo_description ?? "",
-						};
-					}
-					// Patch hero image alt if Vision succeeded and image exists
-					if (visionResult && featuredImage && typeof featuredImage === "object") {
-						updatePayload["featured_image"] = {
-							...featuredImage,
-							alt: visionResult.altText,
-							// Store figcaption in a custom field if the schema supports it;
-							// otherwise it will be accessible via the alt field and plugin storage.
-							caption: visionResult.figcaption,
-						};
-						// Persist figcaption to plugin KV so themes can read it independently
-						await ctx.kv.set(`figcaption:${ev.collection}:${contentId}`, visionResult.figcaption);
-						log.info(`Vision figcaption stored for ${contentId}`);
-					}
+						if (updater) {
+							try {
+								await updater.update(ev.collection, contentId, updatePayload);
+								log.debug(`Meta block processed: ${ev.collection}/${contentId}`);
+							} catch (err) {
+								log.error(`Meta block update failed: ${err}`);
+							}
+						}
 
-					// Strip the meta block (and set SEO) in a single content update
-					if (ctx.content && "update" in ctx.content) {
-						try {
-							await (ctx.content as {
-								update: (col: string, id: string, data: Record<string, unknown>) => Promise<unknown>;
-							}).update(ev.collection, contentId, updatePayload);
-							log.debug(`Content updated: ${ev.collection}/${contentId}`);
-						} catch (err) {
-							log.error(`Content update failed: ${err}`);
+						// Taxonomy assignment — each taxonomy fails independently
+						const assignments = [
+							{ taxName: cfg.taxonomyMap.categories, slugs: meta.categories ?? [], autoCreate: false },
+							{ taxName: cfg.taxonomyMap.tags,       slugs: meta.tags ?? [],       autoCreate: cfg.autoCreateTags },
+							{ taxName: cfg.taxonomyMap.regions,    slugs: meta.regions ?? [],    autoCreate: false },
+							{ taxName: cfg.taxonomyMap.eras,       slugs: meta.eras ?? [],       autoCreate: false },
+						];
+
+						if (assignments.some((a) => a.slugs.length > 0)) {
+							let db: Db;
+							try {
+								db = await getDb();
+								for (const { taxName, slugs, autoCreate } of assignments) {
+									if (slugs.length === 0) continue;
+									try {
+										const groups = await resolveTermSlugs(db, taxName, slugs, autoCreate, log);
+										if (groups.length > 0) {
+											await setContentTerms(db, ev.collection, contentId, taxName, groups);
+											log.info(`Assigned "${taxName}": ${slugs.join(", ")}`);
+										}
+									} catch (err) {
+										log.error(`Taxonomy "${taxName}" failed: ${err}`);
+									}
+								}
+							} catch (err) {
+								log.error(`Could not get DB: ${err}`);
+							}
 						}
 					}
 
-					// Taxonomy assignment — each taxonomy fails independently
-					const assignments = [
-						{ taxName: cfg.taxonomyMap.categories, slugs: meta.categories ?? [], autoCreate: false },
-						{ taxName: cfg.taxonomyMap.tags,       slugs: meta.tags ?? [],       autoCreate: cfg.autoCreateTags },
-						{ taxName: cfg.taxonomyMap.regions,    slugs: meta.regions ?? [],    autoCreate: false },
-						{ taxName: cfg.taxonomyMap.eras,       slugs: meta.eras ?? [],       autoCreate: false },
-					];
-
-					if (assignments.every((a) => a.slugs.length === 0)) return;
-
-					let db: Db;
-					try {
-						db = await getDb();
-					} catch (err) {
-						log.error(`Could not get DB: ${err}`);
-						return;
-					}
-
-					for (const { taxName, slugs, autoCreate } of assignments) {
-						if (slugs.length === 0) continue;
-						try {
-							const groups = await resolveTermSlugs(db, taxName, slugs, autoCreate, log);
-							if (groups.length > 0) {
-								await setContentTerms(db, ev.collection, contentId, taxName, groups);
-								log.info(`Assigned "${taxName}": ${slugs.join(", ")}`);
+					// ── Path 2: Auto-generate excerpt when absent ─────────────────────
+					// Fires on every save. Only runs when excerpt is blank so it never
+					// overwrites a manually authored excerpt.
+					if (cfg.autoExcerpt && updater) {
+						const existingExcerpt =
+							typeof contentData.excerpt === "string" ? contentData.excerpt.trim() : "";
+						if (!existingExcerpt) {
+							const title = typeof contentData.title === "string" ? contentData.title : "";
+							const bodyText = extractPlainText(contentData.content);
+							if (title && bodyText) {
+								const generated = await generateAutoExcerpt(title, bodyText, log);
+								if (generated) {
+									try {
+										await updater.update(ev.collection, contentId, { excerpt: generated });
+										log.info(`Auto-excerpt saved for ${ev.collection}/${contentId}`);
+									} catch (err) {
+										log.error(`Auto-excerpt save failed: ${err}`);
+									}
+								}
 							}
-						} catch (err) {
-							log.error(`Taxonomy "${taxName}" failed: ${err}`);
 						}
 					}
 				},
