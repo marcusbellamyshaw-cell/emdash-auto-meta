@@ -19,6 +19,22 @@ export interface EmdashAutoMetaConfig {
 	 */
 	autoExcerpt?: boolean;
 	/**
+	 * Anthropic API key for the Vision + excerpt calls. Prefer setting this
+	 * explicitly here — relying on process.env only works under nodejs_compat
+	 * and the global fallback never resolves on Workers. If omitted, falls back
+	 * to process.env.ANTHROPIC_API_KEY then globalThis.ANTHROPIC_API_KEY.
+	 */
+	anthropicApiKey?: string;
+	/**
+	 * Absolute origin of the deployed site (e.g. "https://everybittexas.com"),
+	 * used to resolve relative media URLs when fetching hero images for Vision.
+	 * On Cloudflare Workers globalThis.location is unreliable, so without this
+	 * the fetch falls back to http://localhost:4321 and Vision silently fails in
+	 * production. If omitted, falls back to globalThis.location.origin, then
+	 * SITE_URL / PUBLIC_SITE_URL env vars, then localhost.
+	 */
+	siteUrl?: string;
+	/**
 	 * Maps the fixed metadata block keys to the actual taxonomy names in your
 	 * Emdash schema. Use this when your site's taxonomies are named differently
 	 * from the defaults.
@@ -41,6 +57,8 @@ interface ResolvedConfig {
 	autoCreateTags: boolean;
 	logLevel: "silent" | "info" | "debug";
 	autoExcerpt: boolean;
+	anthropicApiKey: string;
+	siteUrl: string;
 	taxonomyMap: {
 		categories: string;
 		tags: string;
@@ -58,6 +76,8 @@ function resolveConfig(config: EmdashAutoMetaConfig): ResolvedConfig {
 		autoCreateTags: config.autoCreateTags ?? true,
 		logLevel: config.logLevel ?? "info",
 		autoExcerpt: config.autoExcerpt ?? true,
+		anthropicApiKey: config.anthropicApiKey ?? "",
+		siteUrl: config.siteUrl ?? "",
 		taxonomyMap: {
 			categories: config.taxonomyMap?.categories ?? "category",
 			tags: config.taxonomyMap?.tags ?? "tag",
@@ -65,6 +85,32 @@ function resolveConfig(config: EmdashAutoMetaConfig): ResolvedConfig {
 			eras: config.taxonomyMap?.eras ?? "eras",
 		},
 	};
+}
+
+/** Read an env var from process.env (nodejs_compat) or globalThis, if present. */
+function readEnvVar(name: string): string | undefined {
+	const fromProcess = typeof process !== "undefined" ? process.env?.[name] : undefined;
+	if (fromProcess) return fromProcess;
+	const g = typeof globalThis !== "undefined" ? (globalThis as unknown as Record<string, unknown>)[name] : undefined;
+	return typeof g === "string" && g ? g : undefined;
+}
+
+/** Resolve the Anthropic API key: explicit config first, then env fallbacks. */
+function resolveApiKey(cfg: ResolvedConfig): string | undefined {
+	return cfg.anthropicApiKey || readEnvVar("ANTHROPIC_API_KEY");
+}
+
+/**
+ * Resolve the site origin for fetching relative media URLs. Explicit config
+ * wins; otherwise try globalThis.location (dev), then SITE_URL/PUBLIC_SITE_URL,
+ * and only then fall back to localhost.
+ */
+function resolveOrigin(cfg: ResolvedConfig): string {
+	if (cfg.siteUrl) return cfg.siteUrl.replace(/\/+$/, "");
+	const loc = typeof globalThis !== "undefined" && "location" in globalThis
+		? (globalThis as unknown as { location?: { origin?: string } }).location?.origin
+		: undefined;
+	return loc || readEnvVar("SITE_URL") || readEnvVar("PUBLIC_SITE_URL") || "http://localhost:4321";
 }
 
 // ─── Metadata Schema ─────────────────────────────────────────────────────────
@@ -97,13 +143,11 @@ interface Logger {
  */
 async function fetchImageAsBase64(
 	imageUrl: string,
+	origin: string,
 	log: Logger,
 ): Promise<{ base64: string; mediaType: "image/jpeg" | "image/png" | "image/gif" | "image/webp" } | null> {
 	try {
-		// Resolve relative URLs to the local Worker origin
-		const origin = typeof globalThis !== "undefined" && "location" in globalThis
-			? (globalThis as unknown as { location: { origin: string } }).location.origin
-			: "http://localhost:4321";
+		// Resolve relative URLs against the configured/resolved site origin.
 		const fullUrl = imageUrl.startsWith("http") ? imageUrl : `${origin}${imageUrl}`;
 		// 10-second timeout — the image may be fetched via a self-referential
 		// subrequest back through the Worker. An unbounded fetch could stall the
@@ -128,7 +172,7 @@ async function fetchImageAsBase64(
 		// Base64 encode
 		let binary = "";
 		for (let i = 0; i < bytes.byteLength; i++) {
-			binary += String.fromCharCode(bytes[i]);
+			binary += String.fromCharCode(bytes[i]!);
 		}
 		const base64 = btoa(binary);
 		return { base64, mediaType };
@@ -155,17 +199,16 @@ interface VisionAltResult {
 export async function generateImageMeta(
 	imageUrl: string,
 	articleTitle: string,
+	apiKey: string | undefined,
+	origin: string,
 	log: Logger,
 ): Promise<VisionAltResult | null> {
-	const apiKey = (typeof process !== "undefined" && process.env?.ANTHROPIC_API_KEY) ??
-		(typeof globalThis !== "undefined" ? (globalThis as unknown as Record<string, string>)["ANTHROPIC_API_KEY"] : undefined);
-
 	if (!apiKey) {
-		log.warn("ANTHROPIC_API_KEY not set – skipping Vision alt text generation");
+		log.warn("Anthropic API key not set – skipping Vision alt text generation");
 		return null;
 	}
 
-	const imageData = await fetchImageAsBase64(imageUrl, log);
+	const imageData = await fetchImageAsBase64(imageUrl, origin, log);
 	if (!imageData) return null;
 
 	try {
@@ -262,16 +305,11 @@ function extractPlainText(content: unknown, maxChars = 600): string {
 async function generateAutoExcerpt(
 	title: string,
 	bodyText: string,
+	apiKey: string | undefined,
 	log: Logger,
 ): Promise<string | null> {
-	const apiKey =
-		(typeof process !== "undefined" && process.env?.ANTHROPIC_API_KEY) ??
-		(typeof globalThis !== "undefined"
-			? (globalThis as unknown as Record<string, string>)["ANTHROPIC_API_KEY"]
-			: undefined);
-
 	if (!apiKey) {
-		log.warn("ANTHROPIC_API_KEY not set – skipping auto-excerpt generation");
+		log.warn("Anthropic API key not set – skipping auto-excerpt generation");
 		return null;
 	}
 
@@ -356,7 +394,9 @@ function extractMeta(
 				try {
 					meta = JSON.parse(match[1]) as AutoMeta;
 				} catch {
-					return null;
+					// Malformed JSON in this block — skip it and keep scanning the rest
+					// of the content instead of aborting all metadata handling.
+					continue;
 				}
 				const cleanedArray = (fieldValue as unknown[]).filter((_, idx) => idx !== i);
 				return { meta, cleanedData: { ...data, [fieldKey]: cleanedArray } };
@@ -447,7 +487,7 @@ async function setContentTerms(
 export function emdashAutoMeta(config: EmdashAutoMetaConfig = {}): PluginDescriptor<EmdashAutoMetaConfig> {
 	return {
 		id: "emdash-auto-meta",
-		version: "1.0.0",
+		version: "1.1.0",
 		entrypoint: "emdash-auto-meta",
 		options: config,
 		capabilities: ["content:write"],
@@ -461,13 +501,13 @@ export function createPlugin(options: EmdashAutoMetaConfig = {}): ResolvedPlugin
 
 	return definePlugin({
 		id: "emdash-auto-meta",
-		version: "1.0.0",
+		version: "1.1.0",
 		capabilities: ["content:write"],
 
 		hooks: {
 			"content:afterSave": {
 				errorPolicy: "continue",
-				handler: async (event: never, ctx: PluginContext) => {
+				handler: async (event: unknown, ctx: PluginContext) => {
 					const log = makeLogger(ctx, cfg.logLevel);
 					const ev = event as { content: Record<string, unknown>; collection: string };
 					const content = ev.content;
@@ -482,11 +522,23 @@ export function createPlugin(options: EmdashAutoMetaConfig = {}): ResolvedPlugin
 						? ctx.content as unknown as ContentUpdater
 						: null;
 
+					const apiKey = resolveApiKey(cfg);
+					const origin = resolveOrigin(cfg);
+
+					// All field changes are folded into ONE update. content:afterSave is
+					// re-triggered by ctx.content.update, so a single combined write
+					// (instead of one for the meta block and a second for the excerpt)
+					// avoids a duplicate excerpt LLM call on the re-entrant save.
+					const updatePayload: Record<string, unknown> = {};
+					let hasUpdate = false;
+
 					// ── Path 1: Explicit <!-- ebt-meta: --> block ─────────────────────
 					const extracted = extractMeta(contentData, cfg.metaPattern);
 					if (extracted) {
 						const { meta, cleanedData } = extracted;
 						log.info(`Processing meta block: ${ev.collection}/${contentId}`);
+						Object.assign(updatePayload, cleanedData);
+						hasUpdate = true;
 
 						// Vision: generate alt text + figcaption for the hero image
 						const featuredImage = contentData.featured_image as Record<string, unknown> | null | undefined;
@@ -500,15 +552,19 @@ export function createPlugin(options: EmdashAutoMetaConfig = {}): ResolvedPlugin
 						let visionResult: VisionAltResult | null = null;
 						if (imageUrl) {
 							const title = typeof contentData.title === "string" ? contentData.title : "";
-							visionResult = await generateImageMeta(imageUrl, title, log);
+							visionResult = await generateImageMeta(imageUrl, title, apiKey, origin, log);
 						}
 
-						// Build update payload: cleaned body + optional SEO + Vision image meta
-						const updatePayload: Record<string, unknown> = { ...cleanedData };
+						// Merge SEO into any existing seo object so other fields (og image,
+						// canonical, …) are preserved rather than wiped.
 						if (meta.seo_title || meta.seo_description) {
+							const existingSeo = contentData.seo && typeof contentData.seo === "object"
+								? (contentData.seo as Record<string, unknown>)
+								: {};
 							updatePayload["seo"] = {
-								title: meta.seo_title ?? "",
-								description: meta.seo_description ?? "",
+								...existingSeo,
+								...(meta.seo_title ? { title: meta.seo_title } : {}),
+								...(meta.seo_description ? { description: meta.seo_description } : {}),
 							};
 						}
 						if (visionResult && featuredImage && typeof featuredImage === "object") {
@@ -520,17 +576,41 @@ export function createPlugin(options: EmdashAutoMetaConfig = {}): ResolvedPlugin
 							await ctx.kv.set(`figcaption:${ev.collection}:${contentId}`, visionResult.figcaption);
 							log.info(`Vision figcaption stored for ${contentId}`);
 						}
+					}
 
-						if (updater) {
-							try {
-								await updater.update(ev.collection, contentId, updatePayload);
-								log.debug(`Meta block processed: ${ev.collection}/${contentId}`);
-							} catch (err) {
-								log.error(`Meta block update failed: ${err}`);
+					// ── Path 2: Auto-generate excerpt when absent ─────────────────────
+					// Only runs when excerpt is blank so it never overwrites a manually
+					// authored excerpt. Folded into the same updatePayload as Path 1.
+					if (cfg.autoExcerpt) {
+						const existingExcerpt =
+							typeof contentData.excerpt === "string" ? contentData.excerpt.trim() : "";
+						if (!existingExcerpt && typeof updatePayload.excerpt !== "string") {
+							const title = typeof contentData.title === "string" ? contentData.title : "";
+							const bodyText = extractPlainText(contentData.content);
+							if (title && bodyText) {
+								const generated = await generateAutoExcerpt(title, bodyText, apiKey, log);
+								if (generated) {
+									updatePayload["excerpt"] = generated;
+									hasUpdate = true;
+								}
 							}
 						}
+					}
 
-						// Taxonomy assignment — each taxonomy fails independently
+					// ── Single combined write ─────────────────────────────────────────
+					if (hasUpdate && updater) {
+						try {
+							await updater.update(ev.collection, contentId, updatePayload);
+							log.debug(`Updated ${ev.collection}/${contentId}`);
+						} catch (err) {
+							log.error(`Update failed: ${err}`);
+						}
+					}
+
+					// ── Taxonomy assignment (only when a meta block was present) ───────
+					// Each taxonomy fails independently; uses direct DB writes (no hook).
+					if (extracted) {
+						const { meta } = extracted;
 						const assignments = [
 							{ taxName: cfg.taxonomyMap.categories, slugs: meta.categories ?? [], autoCreate: false },
 							{ taxName: cfg.taxonomyMap.tags,       slugs: meta.tags ?? [],       autoCreate: cfg.autoCreateTags },
@@ -556,29 +636,6 @@ export function createPlugin(options: EmdashAutoMetaConfig = {}): ResolvedPlugin
 								}
 							} catch (err) {
 								log.error(`Could not get DB: ${err}`);
-							}
-						}
-					}
-
-					// ── Path 2: Auto-generate excerpt when absent ─────────────────────
-					// Fires on every save. Only runs when excerpt is blank so it never
-					// overwrites a manually authored excerpt.
-					if (cfg.autoExcerpt && updater) {
-						const existingExcerpt =
-							typeof contentData.excerpt === "string" ? contentData.excerpt.trim() : "";
-						if (!existingExcerpt) {
-							const title = typeof contentData.title === "string" ? contentData.title : "";
-							const bodyText = extractPlainText(contentData.content);
-							if (title && bodyText) {
-								const generated = await generateAutoExcerpt(title, bodyText, log);
-								if (generated) {
-									try {
-										await updater.update(ev.collection, contentId, { excerpt: generated });
-										log.info(`Auto-excerpt saved for ${ev.collection}/${contentId}`);
-									} catch (err) {
-										log.error(`Auto-excerpt save failed: ${err}`);
-									}
-								}
 							}
 						}
 					}
