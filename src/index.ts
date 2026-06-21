@@ -48,6 +48,14 @@ export interface EmdashAutoMetaConfig {
 		regions?: string;
 		/** Taxonomy name for the "eras" key. Default: "eras" */
 		eras?: string;
+		/** Taxonomy name for the "counties" key. Default: "counties" */
+		counties?: string;
+		/** Taxonomy name for the "cities" key. Default: "cities" */
+		cities?: string;
+		/** Taxonomy name for the "people" key. Default: "people" */
+		people?: string;
+		/** Taxonomy name for the "content_types" key. Default: "content_types" */
+		content_types?: string;
 	};
 }
 
@@ -64,6 +72,10 @@ interface ResolvedConfig {
 		tags: string;
 		regions: string;
 		eras: string;
+		counties: string;
+		cities: string;
+		people: string;
+		content_types: string;
 	};
 }
 
@@ -83,6 +95,10 @@ function resolveConfig(config: EmdashAutoMetaConfig): ResolvedConfig {
 			tags: config.taxonomyMap?.tags ?? "tag",
 			regions: config.taxonomyMap?.regions ?? "regions",
 			eras: config.taxonomyMap?.eras ?? "eras",
+			counties: config.taxonomyMap?.counties ?? "counties",
+			cities: config.taxonomyMap?.cities ?? "cities",
+			people: config.taxonomyMap?.people ?? "people",
+			content_types: config.taxonomyMap?.content_types ?? "content_types",
 		},
 	};
 }
@@ -120,6 +136,10 @@ export interface AutoMeta {
 	tags?: string[];
 	regions?: string[];
 	eras?: string[];
+	counties?: string[];
+	cities?: string[];
+	people?: string[];
+	content_types?: string[];
 	seo_title?: string;
 	seo_description?: string;
 }
@@ -482,12 +502,58 @@ async function setContentTerms(
 	}
 }
 
+/**
+ * Assign every taxonomy referenced in a meta block to the content item.
+ * Direct DB writes (no content hook). Each taxonomy fails independently so a
+ * single bad term never blocks the others. Handles all eight taxonomy keys.
+ */
+async function assignTaxonomies(
+	collection: string,
+	contentId: string,
+	meta: AutoMeta,
+	cfg: ResolvedConfig,
+	log: Logger,
+): Promise<void> {
+	const assignments = [
+		{ taxName: cfg.taxonomyMap.categories, slugs: meta.categories ?? [], autoCreate: false },
+		{ taxName: cfg.taxonomyMap.tags, slugs: meta.tags ?? [], autoCreate: cfg.autoCreateTags },
+		{ taxName: cfg.taxonomyMap.regions, slugs: meta.regions ?? [], autoCreate: false },
+		{ taxName: cfg.taxonomyMap.eras, slugs: meta.eras ?? [], autoCreate: false },
+		{ taxName: cfg.taxonomyMap.counties, slugs: meta.counties ?? [], autoCreate: false },
+		{ taxName: cfg.taxonomyMap.cities, slugs: meta.cities ?? [], autoCreate: cfg.autoCreateTags },
+		{ taxName: cfg.taxonomyMap.people, slugs: meta.people ?? [], autoCreate: cfg.autoCreateTags },
+		{ taxName: cfg.taxonomyMap.content_types, slugs: meta.content_types ?? [], autoCreate: false },
+	];
+	if (!assignments.some((a) => a.slugs.length > 0)) return;
+
+	let db: Db;
+	try {
+		db = await getDb();
+	} catch (err) {
+		log.error(`Could not get DB: ${err}`);
+		return;
+	}
+
+	for (const { taxName, slugs, autoCreate } of assignments) {
+		if (slugs.length === 0) continue;
+		try {
+			const groups = await resolveTermSlugs(db, taxName, slugs, autoCreate, log);
+			if (groups.length > 0) {
+				await setContentTerms(db, collection, contentId, taxName, groups);
+				log.info(`Assigned "${taxName}": ${slugs.join(", ")}`);
+			}
+		} catch (err) {
+			log.error(`Taxonomy "${taxName}" failed: ${err}`);
+		}
+	}
+}
+
 // ─── Descriptor Factory ───────────────────────────────────────────────────────
 
 export function emdashAutoMeta(config: EmdashAutoMetaConfig = {}): PluginDescriptor<EmdashAutoMetaConfig> {
 	return {
 		id: "emdash-auto-meta",
-		version: "1.1.0",
+		version: "1.2.1",
 		entrypoint: "emdash-auto-meta",
 		options: config,
 		capabilities: ["content:write"],
@@ -501,7 +567,7 @@ export function createPlugin(options: EmdashAutoMetaConfig = {}): ResolvedPlugin
 
 	return definePlugin({
 		id: "emdash-auto-meta",
-		version: "1.1.0",
+		version: "1.2.1",
 		capabilities: ["content:write"],
 
 		hooks: {
@@ -515,6 +581,24 @@ export function createPlugin(options: EmdashAutoMetaConfig = {}): ResolvedPlugin
 					const contentData = content.data as Record<string, unknown> | null | undefined;
 					if (!contentId || !contentData) return;
 
+					// Only act on saves that carry a meta block. The strip update below
+					// removes the block, so the re-entrant content:afterSave it triggers
+					// finds no block here and returns early — no loops, and no duplicate
+					// Vision/excerpt LLM calls on the re-entrant save.
+					const extracted = extractMeta(contentData, cfg.metaPattern);
+					if (!extracted) return;
+					const { meta, cleanedData } = extracted;
+					log.info(`Processing meta block: ${ev.collection}/${contentId}`);
+
+					// ── CRITICAL PATH FIRST: taxonomy assignment ──────────────────
+					// Runs BEFORE the slow Vision/excerpt LLM work below. On Cloudflare
+					// Workers the content:afterSave continuation can be cut off once the
+					// HTTP response is returned; doing these fast DB writes first means
+					// taxonomies are always assigned even if the best-effort LLM steps
+					// get starved. (This was the regression: the Vision call ran first
+					// and the handler died before ever reaching taxonomy assignment.)
+					await assignTaxonomies(ev.collection, contentId, meta, cfg, log);
+
 					type ContentUpdater = {
 						update: (col: string, id: string, data: Record<string, unknown>) => Promise<unknown>;
 					};
@@ -522,121 +606,85 @@ export function createPlugin(options: EmdashAutoMetaConfig = {}): ResolvedPlugin
 						? ctx.content as unknown as ContentUpdater
 						: null;
 
+					// ── Strip the meta block + set SEO (fast, no LLM) ─────────────
+					// Its own update so the authored comment is removed and SEO is set
+					// reliably, even if the Vision/excerpt work below is cut short.
+					const stripPayload: Record<string, unknown> = { ...cleanedData };
+					if (meta.seo_title || meta.seo_description) {
+						const existingSeo = contentData.seo && typeof contentData.seo === "object"
+							? (contentData.seo as Record<string, unknown>)
+							: {};
+						stripPayload["seo"] = {
+							...existingSeo,
+							...(meta.seo_title ? { title: meta.seo_title } : {}),
+							...(meta.seo_description ? { description: meta.seo_description } : {}),
+						};
+					}
+					if (updater) {
+						try {
+							await updater.update(ev.collection, contentId, stripPayload);
+							log.debug(`Stripped meta block: ${ev.collection}/${contentId}`);
+						} catch (err) {
+							log.error(`Strip update failed: ${err}`);
+						}
+					}
+
+					// ── Best-effort LLM extras: Vision alt/caption + auto-excerpt ──
+					// Intentionally LAST. These are slow and may be cut short on
+					// Workers, but the critical taxonomy + block-strip + SEO work
+					// above is already done by this point.
 					const apiKey = resolveApiKey(cfg);
 					const origin = resolveOrigin(cfg);
+					const extrasPayload: Record<string, unknown> = {};
+					let hasExtras = false;
 
-					// All field changes are folded into ONE update. content:afterSave is
-					// re-triggered by ctx.content.update, so a single combined write
-					// (instead of one for the meta block and a second for the excerpt)
-					// avoids a duplicate excerpt LLM call on the re-entrant save.
-					const updatePayload: Record<string, unknown> = {};
-					let hasUpdate = false;
-
-					// ── Path 1: Explicit <!-- ebt-meta: --> block ─────────────────────
-					const extracted = extractMeta(contentData, cfg.metaPattern);
-					if (extracted) {
-						const { meta, cleanedData } = extracted;
-						log.info(`Processing meta block: ${ev.collection}/${contentId}`);
-						Object.assign(updatePayload, cleanedData);
-						hasUpdate = true;
-
-						// Vision: generate alt text + figcaption for the hero image
-						const featuredImage = contentData.featured_image as Record<string, unknown> | null | undefined;
-						const imageStorageKey =
-							(featuredImage?.meta as Record<string, unknown> | undefined)?.storageKey as string | undefined ??
-							(typeof featuredImage?.id === "string" ? featuredImage.id : undefined);
-						const imageUrl = imageStorageKey
-							? `/_emdash/api/media/file/${imageStorageKey}`
-							: (typeof featuredImage?.src === "string" ? featuredImage.src : undefined);
-
-						let visionResult: VisionAltResult | null = null;
-						if (imageUrl) {
-							const title = typeof contentData.title === "string" ? contentData.title : "";
-							visionResult = await generateImageMeta(imageUrl, title, apiKey, origin, log);
-						}
-
-						// Merge SEO into any existing seo object so other fields (og image,
-						// canonical, …) are preserved rather than wiped.
-						if (meta.seo_title || meta.seo_description) {
-							const existingSeo = contentData.seo && typeof contentData.seo === "object"
-								? (contentData.seo as Record<string, unknown>)
-								: {};
-							updatePayload["seo"] = {
-								...existingSeo,
-								...(meta.seo_title ? { title: meta.seo_title } : {}),
-								...(meta.seo_description ? { description: meta.seo_description } : {}),
-							};
-						}
-						if (visionResult && featuredImage && typeof featuredImage === "object") {
-							updatePayload["featured_image"] = {
+					// Vision: generate alt text + figcaption for the hero image
+					const featuredImage = contentData.featured_image as Record<string, unknown> | null | undefined;
+					const imageStorageKey =
+						(featuredImage?.meta as Record<string, unknown> | undefined)?.storageKey as string | undefined ??
+						(typeof featuredImage?.id === "string" ? featuredImage.id : undefined);
+					const imageUrl = imageStorageKey
+						? `/_emdash/api/media/file/${imageStorageKey}`
+						: (typeof featuredImage?.src === "string" ? featuredImage.src : undefined);
+					if (imageUrl && featuredImage && typeof featuredImage === "object") {
+						const title = typeof contentData.title === "string" ? contentData.title : "";
+						const visionResult = await generateImageMeta(imageUrl, title, apiKey, origin, log);
+						if (visionResult) {
+							extrasPayload["featured_image"] = {
 								...featuredImage,
 								alt: visionResult.altText,
 								caption: visionResult.figcaption,
 							};
+							hasExtras = true;
 							await ctx.kv.set(`figcaption:${ev.collection}:${contentId}`, visionResult.figcaption);
 							log.info(`Vision figcaption stored for ${contentId}`);
 						}
 					}
 
-					// ── Path 2: Auto-generate excerpt when absent ─────────────────────
-					// Only runs when excerpt is blank so it never overwrites a manually
-					// authored excerpt. Folded into the same updatePayload as Path 1.
+					// Auto-generate excerpt only when one isn't already present, so it
+					// never overwrites a manually authored excerpt.
 					if (cfg.autoExcerpt) {
 						const existingExcerpt =
 							typeof contentData.excerpt === "string" ? contentData.excerpt.trim() : "";
-						if (!existingExcerpt && typeof updatePayload.excerpt !== "string") {
+						if (!existingExcerpt) {
 							const title = typeof contentData.title === "string" ? contentData.title : "";
 							const bodyText = extractPlainText(contentData.content);
 							if (title && bodyText) {
 								const generated = await generateAutoExcerpt(title, bodyText, apiKey, log);
 								if (generated) {
-									updatePayload["excerpt"] = generated;
-									hasUpdate = true;
+									extrasPayload["excerpt"] = generated;
+									hasExtras = true;
 								}
 							}
 						}
 					}
 
-					// ── Single combined write ─────────────────────────────────────────
-					if (hasUpdate && updater) {
+					if (hasExtras && updater) {
 						try {
-							await updater.update(ev.collection, contentId, updatePayload);
-							log.debug(`Updated ${ev.collection}/${contentId}`);
+							await updater.update(ev.collection, contentId, extrasPayload);
+							log.debug(`Applied LLM extras: ${ev.collection}/${contentId}`);
 						} catch (err) {
-							log.error(`Update failed: ${err}`);
-						}
-					}
-
-					// ── Taxonomy assignment (only when a meta block was present) ───────
-					// Each taxonomy fails independently; uses direct DB writes (no hook).
-					if (extracted) {
-						const { meta } = extracted;
-						const assignments = [
-							{ taxName: cfg.taxonomyMap.categories, slugs: meta.categories ?? [], autoCreate: false },
-							{ taxName: cfg.taxonomyMap.tags,       slugs: meta.tags ?? [],       autoCreate: cfg.autoCreateTags },
-							{ taxName: cfg.taxonomyMap.regions,    slugs: meta.regions ?? [],    autoCreate: false },
-							{ taxName: cfg.taxonomyMap.eras,       slugs: meta.eras ?? [],       autoCreate: false },
-						];
-
-						if (assignments.some((a) => a.slugs.length > 0)) {
-							let db: Db;
-							try {
-								db = await getDb();
-								for (const { taxName, slugs, autoCreate } of assignments) {
-									if (slugs.length === 0) continue;
-									try {
-										const groups = await resolveTermSlugs(db, taxName, slugs, autoCreate, log);
-										if (groups.length > 0) {
-											await setContentTerms(db, ev.collection, contentId, taxName, groups);
-											log.info(`Assigned "${taxName}": ${slugs.join(", ")}`);
-										}
-									} catch (err) {
-										log.error(`Taxonomy "${taxName}" failed: ${err}`);
-									}
-								}
-							} catch (err) {
-								log.error(`Could not get DB: ${err}`);
-							}
+							log.error(`Extras update failed: ${err}`);
 						}
 					}
 				},

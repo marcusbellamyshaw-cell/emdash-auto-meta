@@ -1,6 +1,6 @@
 {
 	"name": "emdash-auto-meta",
-	"version": "1.1.0",
+	"version": "1.2.1",
 	"description": "Emdash CMS plugin that enables AI agents to assign taxonomy terms and set SEO metadata via the content:afterSave hook. Includes Vision LLM for hero image alt text and figcaption generation.",
 	"type": "module",
 	"exports": {
