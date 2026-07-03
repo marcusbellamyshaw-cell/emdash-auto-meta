@@ -157,6 +157,35 @@ interface Logger {
 
 // ─── Vision LLM: Alt Text + Figcaption Generation ────────────────────────────
 
+// Blocks metadata/link-local/loopback/private hosts even if they somehow
+// match the configured origin's hostname (defense-in-depth on top of the
+// same-origin check below).
+const BLOCKED_HOSTS = /^(169\.254\.169\.254|metadata\.google\.internal|localhost|127\.|10\.|192\.168\.|::1)/i;
+function isPrivateOrLinkLocalIp(hostname: string): boolean {
+	if (BLOCKED_HOSTS.test(hostname)) return true;
+	const m = hostname.match(/^172\.(\d{1,3})\./);
+	if (m && Number(m[1]) >= 16 && Number(m[1]) <= 31) return true;
+	return false;
+}
+
+/**
+ * Only same-origin (or relative, resolved same-origin) http(s) URLs are
+ * allowed — `featured_image.src` is an ordinary content-editor field, not
+ * admin-only, so an absolute URL there must never be fetched as-is.
+ */
+function isSafeImageUrl(fullUrl: string, origin: string): boolean {
+	try {
+		const parsed = new URL(fullUrl);
+		const originHost = new URL(origin).hostname;
+		if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+		if (parsed.hostname !== originHost) return false;
+		if (isPrivateOrLinkLocalIp(parsed.hostname)) return false;
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 /**
  * Fetch image bytes from a local Emdash media URL and convert to base64.
  * Returns null on any failure so callers can fall back gracefully.
@@ -169,6 +198,10 @@ async function fetchImageAsBase64(
 	try {
 		// Resolve relative URLs against the configured/resolved site origin.
 		const fullUrl = imageUrl.startsWith("http") ? imageUrl : `${origin}${imageUrl}`;
+		if (!isSafeImageUrl(fullUrl, origin)) {
+			log.warn(`Vision fetch blocked (unsafe URL): ${fullUrl}`);
+			return null;
+		}
 		// 10-second timeout — the image may be fetched via a self-referential
 		// subrequest back through the Worker. An unbounded fetch could stall the
 		// content:afterSave hook for the full Cloudflare subrequest timeout.
