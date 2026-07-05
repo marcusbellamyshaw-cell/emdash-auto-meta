@@ -424,10 +424,38 @@ function makeLogger(ctx: PluginContext, level: "silent" | "info" | "debug"): Log
 	};
 }
 
-function extractMeta(
+/**
+ * Merge dual key-style fields (underscored + space-separated) into the
+ * canonical AutoMeta shape. Only fields that contain an underscore need
+ * this — space is the Markdown-safe workaround for those.
+ */
+function normalizeMeta(raw: Record<string, unknown>): AutoMeta {
+	const pick = <T,>(a: string, b: string): T | undefined => (raw[a] ?? raw[b]) as T | undefined;
+	return {
+		categories: raw.categories as string[] | undefined,
+		tags: raw.tags as string[] | undefined,
+		regions: raw.regions as string[] | undefined,
+		eras: raw.eras as string[] | undefined,
+		counties: raw.counties as string[] | undefined,
+		cities: raw.cities as string[] | undefined,
+		people: raw.people as string[] | undefined,
+		content_types: pick<string[]>("content_types", "content types"),
+		seo_title: pick<string>("seo_title", "seo title"),
+		seo_description: pick<string>("seo_description", "seo description"),
+	};
+}
+
+export interface ExtractedMeta {
+	cleanedData: Record<string, unknown>;
+	meta?: AutoMeta;
+	parseError?: { raw: string; message: string };
+}
+
+export function extractMeta(
 	data: Record<string, unknown>,
 	pattern: RegExp,
-): { meta: AutoMeta; cleanedData: Record<string, unknown> } | null {
+	metaPrefix: string,
+): ExtractedMeta | null {
 	for (const [fieldKey, fieldValue] of Object.entries(data)) {
 		if (!Array.isArray(fieldValue)) continue;
 		for (let i = 0; i < fieldValue.length; i++) {
@@ -437,22 +465,29 @@ function extractMeta(
 			if (blockObj._type !== "block") continue;
 			const children = blockObj.children;
 			if (!Array.isArray(children)) continue;
-			for (const child of children) {
-				if (!child || typeof child !== "object") continue;
-				const childObj = child as Record<string, unknown>;
-				if (typeof childObj.text !== "string") continue;
-				const match = childObj.text.match(pattern);
-				if (!match?.[1]) continue;
-				let meta: AutoMeta;
-				try {
-					meta = JSON.parse(match[1]) as AutoMeta;
-				} catch {
-					// Malformed JSON in this block — skip it and keep scanning the rest
-					// of the content instead of aborting all metadata handling.
-					continue;
-				}
-				const cleanedArray = (fieldValue as unknown[]).filter((_, idx) => idx !== i);
-				return { meta, cleanedData: { ...data, [fieldKey]: cleanedArray } };
+			// Reconstruct the block's full text from every span child, in order,
+			// regardless of which spans carry marks. Markdown-to-PortableText
+			// conversion can split the meta block into multiple spans (e.g. a
+			// pair of underscores becomes an "em" mark), fragmenting the JSON
+			// string across children — concatenating them back in order undoes
+			// that split before JSON.parse ever sees it.
+			const fullText = children
+				.filter((c): c is Record<string, unknown> => !!c && typeof c === "object")
+				.map((c) => (typeof c.text === "string" ? c.text : ""))
+				.join("");
+			if (!fullText.includes(metaPrefix)) continue;
+			const match = fullText.match(pattern);
+			if (!match?.[1]) continue;
+			const cleanedArray = (fieldValue as unknown[]).filter((_, idx) => idx !== i);
+			const cleanedData = { ...data, [fieldKey]: cleanedArray };
+			try {
+				const meta = normalizeMeta(JSON.parse(match[1]) as Record<string, unknown>);
+				return { meta, cleanedData };
+			} catch (err) {
+				return {
+					parseError: { raw: match[1], message: err instanceof Error ? err.message : String(err) },
+					cleanedData,
+				};
 			}
 		}
 	}
@@ -586,7 +621,7 @@ async function assignTaxonomies(
 export function emdashAutoMeta(config: EmdashAutoMetaConfig = {}): PluginDescriptor<EmdashAutoMetaConfig> {
 	return {
 		id: "emdash-auto-meta",
-		version: "1.2.1",
+		version: "1.3.0",
 		entrypoint: "emdash-auto-meta",
 		options: config,
 		capabilities: ["content:write"],
@@ -600,7 +635,7 @@ export function createPlugin(options: EmdashAutoMetaConfig = {}): ResolvedPlugin
 
 	return definePlugin({
 		id: "emdash-auto-meta",
-		version: "1.2.1",
+		version: "1.3.0",
 		capabilities: ["content:write"],
 
 		hooks: {
@@ -618,10 +653,42 @@ export function createPlugin(options: EmdashAutoMetaConfig = {}): ResolvedPlugin
 					// removes the block, so the re-entrant content:afterSave it triggers
 					// finds no block here and returns early — no loops, and no duplicate
 					// Vision/excerpt LLM calls on the re-entrant save.
-					const extracted = extractMeta(contentData, cfg.metaPattern);
+					const extracted = extractMeta(contentData, cfg.metaPattern, cfg.metaPrefix);
 					if (!extracted) return;
-					const { meta, cleanedData } = extracted;
 					log.info(`Processing meta block: ${ev.collection}/${contentId}`);
+
+					type ContentUpdater = {
+						update: (col: string, id: string, data: Record<string, unknown>) => Promise<unknown>;
+					};
+					const updater = (ctx.content && "update" in ctx.content)
+						? ctx.content as unknown as ContentUpdater
+						: null;
+
+					if (extracted.parseError) {
+						const { raw, message } = extracted.parseError;
+						log.error(
+							`Meta block parse failed for ${ev.collection}/${contentId}: ${message} | raw="${raw}"`,
+						);
+						// Visible failure signal (not a silent no-op) since the hook's
+						// errorPolicy:"continue" means a thrown error here wouldn't
+						// reliably surface back to the MCP caller.
+						await ctx.kv.set(
+							`metaParseError:${ev.collection}:${contentId}`,
+							JSON.stringify({ raw, message, at: new Date().toISOString() }),
+						);
+						// Still strip the malformed block so the raw comment doesn't leak
+						// into published content, but skip taxonomy/SEO/LLM work below.
+						if (updater) {
+							try {
+								await updater.update(ev.collection, contentId, extracted.cleanedData);
+							} catch (err) {
+								log.error(`Strip update failed after parse error: ${err}`);
+							}
+						}
+						return;
+					}
+					const meta = extracted.meta!;
+					const cleanedData = extracted.cleanedData;
 
 					// ── CRITICAL PATH FIRST: taxonomy assignment ──────────────────
 					// Runs BEFORE the slow Vision/excerpt LLM work below. On Cloudflare
@@ -631,13 +698,6 @@ export function createPlugin(options: EmdashAutoMetaConfig = {}): ResolvedPlugin
 					// get starved. (This was the regression: the Vision call ran first
 					// and the handler died before ever reaching taxonomy assignment.)
 					await assignTaxonomies(ev.collection, contentId, meta, cfg, log);
-
-					type ContentUpdater = {
-						update: (col: string, id: string, data: Record<string, unknown>) => Promise<unknown>;
-					};
-					const updater = (ctx.content && "update" in ctx.content)
-						? ctx.content as unknown as ContentUpdater
-						: null;
 
 					// ── Strip the meta block + set SEO (fast, no LLM) ─────────────
 					// Its own update so the authored comment is removed and SEO is set

@@ -84,6 +84,8 @@ Append this block to the end of any Portable Text content field when creating a 
 
 The block must be a single Portable Text block node containing the raw HTML comment. All fields are optional — include only what you need.
 
+**Both key styles are accepted for underscored fields.** `seo_title`, `seo_description`, and `content_types` can be written with underscores or spaces (`"seo title"`, `"seo description"`, `"content types"`) — both are read identically. Space-separated keys exist because Markdown parses a lone underscore as an italic delimiter; if a block has two or more underscored keys, the Markdown-to-PortableText conversion (which runs before this plugin sees the content) can split the block into multiple spans. As of v1.3.0 the plugin reconstructs the full block text from every span before parsing, so underscored keys work reliably too — but the space-separated style remains supported for content written under the old workaround, and as a defensive fallback.
+
 ### TypeScript Interface
 
 ```typescript
@@ -156,6 +158,7 @@ lowercase and hyphenated (e.g. "history-landmarks", not "History Landmarks").
 - **Media upload not supported in v1.0.** Attaching images via URL is planned for v1.1, pending a reliable solution for server-side image fetching in the Cloudflare Workers environment. For now, upload images manually through the Emdash admin after creating a post.
 - **Metadata block must be in a Portable Text field.** The plugin scans only `_type: "block"` nodes inside array fields. It will not find the block in plain text or other field types.
 - **One metadata block per save.** Only the first block found is processed. If the agent writes multiple blocks, only the first is consumed; the rest remain in the content.
+- **Unparseable meta block.** If the block is found but still isn't valid JSON after span reconstruction, the plugin does not silently ignore it: it logs an error with the post id, the reconstructed raw string, and the parse error, and writes the same to KV under `metaParseError:<collection>:<id>` so the failure is visible even though `content:afterSave` runs after the MCP call has already returned success.
 
 ## Contributing
 

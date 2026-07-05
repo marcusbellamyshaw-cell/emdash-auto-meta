@@ -3,6 +3,7 @@
 		"target": "ES2022",
 		"module": "preserve",
 		"moduleResolution": "bundler",
+		"allowImportingTsExtensions": true,
 		"strict": true,
 		"noUncheckedIndexedAccess": true,
 		"verbatimModuleSyntax": true,
