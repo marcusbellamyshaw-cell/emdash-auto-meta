@@ -1,6 +1,5 @@
-import { definePlugin, ulid } from "emdash";
+import { definePlugin } from "emdash";
 import type { PluginContext, PluginDescriptor, ResolvedPlugin } from "emdash";
-import { getDb } from "emdash/runtime";
 import Anthropic from "@anthropic-ai/sdk";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -146,7 +145,6 @@ export interface AutoMeta {
 
 // ─── Internal Types ───────────────────────────────────────────────────────────
 
-type Db = Awaited<ReturnType<typeof getDb>>;
 
 interface Logger {
 	debug(msg: string): void;
@@ -494,88 +492,70 @@ export function extractMeta(
 	return null;
 }
 
-async function resolveTermSlugs(
-	db: Db,
+// Taxonomy writes go through the supported ctx.taxonomies API (taxonomies:write)
+// rather than raw SQL on core's internal tables, whose schema changed with the
+// i18n taxonomy migration. Terms are matched by slug across locales.
+type TaxonomiesApi = NonNullable<PluginContext["taxonomies"]>;
+
+function labelFromSlug(slug: string): string {
+	return slug
+		.split("-")
+		.map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+		.join(" ");
+}
+
+async function resolveTermIds(
+	taxonomies: TaxonomiesApi,
 	taxonomyName: string,
 	slugs: string[],
 	autoCreate: boolean,
 	log: Logger,
 ): Promise<string[]> {
 	if (slugs.length === 0) return [];
-	const rows = await db
-		.selectFrom("taxonomies")
-		.select(["slug", "translation_group"])
-		.where("name", "=", taxonomyName)
-		.where("slug", "in", slugs)
-		.execute();
-	const existingBySlug = new Map(rows.map((r) => [r.slug, r.translation_group]));
-	const groups: string[] = [];
+	const existing = await taxonomies.getTerms(taxonomyName);
+	const bySlug = new Map(existing.map((t) => [t.slug, t.id]));
+	const ids: string[] = [];
 	for (const slug of slugs) {
-		const group = existingBySlug.get(slug);
-		if (group) {
-			groups.push(group);
-		} else if (autoCreate) {
-			const id = ulid();
-			const label = slug
-				.split("-")
-				.map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-				.join(" ");
-			await db
-				.insertInto("taxonomies")
-				.values({ id, name: taxonomyName, slug, label, parent_id: null, data: null, locale: "en", translation_group: id } as never)
-				.execute();
-			groups.push(id);
+		const id = bySlug.get(slug);
+		if (id) {
+			ids.push(id);
+		} else if (autoCreate && taxonomies.createTerm) {
+			const created = await taxonomies.createTerm(taxonomyName, { label: labelFromSlug(slug), slug });
+			bySlug.set(slug, created.id);
+			ids.push(created.id);
 			log.info(`Created "${taxonomyName}" term: ${slug}`);
 		} else {
 			log.warn(`Term not found: ${taxonomyName}/${slug}`);
 		}
 	}
-	return groups;
+	return ids;
 }
 
-async function setContentTerms(
-	db: Db,
+// Replace semantics (as before): the entry ends up with exactly `termIds` in this
+// taxonomy, so a re-save with a different meta block doesn't accumulate stale terms.
+async function setEntryTerms(
+	taxonomies: TaxonomiesApi,
 	collection: string,
 	entryId: string,
 	taxonomyName: string,
-	termGroups: string[],
+	termIds: string[],
 ): Promise<void> {
-	const newSet = new Set(termGroups);
-	const current = await db
-		.selectFrom("content_taxonomies")
-		.innerJoin("taxonomies", "taxonomies.translation_group", "content_taxonomies.taxonomy_id")
-		.select("content_taxonomies.taxonomy_id")
-		.distinct()
-		.where("content_taxonomies.collection", "=", collection)
-		.where("content_taxonomies.entry_id", "=", entryId)
-		.where("taxonomies.name", "=", taxonomyName)
-		.execute();
-	const currentSet = new Set(current.map((r) => r.taxonomy_id));
-	const toRemove = [...currentSet].filter((g) => !newSet.has(g));
-	if (toRemove.length > 0) {
-		await db
-			.deleteFrom("content_taxonomies")
-			.where("collection", "=", collection)
-			.where("entry_id", "=", entryId)
-			.where("taxonomy_id", "in", toRemove)
-			.execute();
-	}
-	const toAdd = [...newSet].filter((g) => !currentSet.has(g));
-	if (toAdd.length > 0) {
-		await db
-			.insertInto("content_taxonomies")
-			.values(toAdd.map((taxonomy_id) => ({ collection, entry_id: entryId, taxonomy_id })))
-			.onConflict((oc) => oc.doNothing())
-			.execute();
-	}
+	const wanted = new Set(termIds);
+	const current = await taxonomies.getEntryTerms(collection, entryId, { taxonomy: taxonomyName });
+	const currentIds = new Set(current.map((t) => t.id));
+	const toRemove = [...currentIds].filter((id) => !wanted.has(id));
+	const toAdd = [...wanted].filter((id) => !currentIds.has(id));
+	if (toRemove.length > 0) await taxonomies.removeEntryTerms!(collection, entryId, taxonomyName, toRemove);
+	if (toAdd.length > 0) await taxonomies.addEntryTerms!(collection, entryId, taxonomyName, toAdd);
 }
 
 /**
- * Assign every taxonomy referenced in a meta block to the content item.
- * Direct DB writes (no content hook). Each taxonomy fails independently so a
- * single bad term never blocks the others. Handles all eight taxonomy keys.
+ * Assign every taxonomy referenced in a meta block to the content item. Each
+ * taxonomy fails independently so a single bad term never blocks the others.
+ * Handles all eight taxonomy keys.
  */
-async function assignTaxonomies(
+export async function assignTaxonomies(
+	ctx: PluginContext,
 	collection: string,
 	contentId: string,
 	meta: AutoMeta,
@@ -594,20 +574,18 @@ async function assignTaxonomies(
 	];
 	if (!assignments.some((a) => a.slugs.length > 0)) return;
 
-	let db: Db;
-	try {
-		db = await getDb();
-	} catch (err) {
-		log.error(`Could not get DB: ${err}`);
+	const taxonomies = ctx.taxonomies;
+	if (!taxonomies?.addEntryTerms) {
+		log.error("ctx.taxonomies is unavailable — does the plugin declare taxonomies:write?");
 		return;
 	}
 
 	for (const { taxName, slugs, autoCreate } of assignments) {
 		if (slugs.length === 0) continue;
 		try {
-			const groups = await resolveTermSlugs(db, taxName, slugs, autoCreate, log);
-			if (groups.length > 0) {
-				await setContentTerms(db, collection, contentId, taxName, groups);
+			const ids = await resolveTermIds(taxonomies, taxName, slugs, autoCreate, log);
+			if (ids.length > 0) {
+				await setEntryTerms(taxonomies, collection, contentId, taxName, ids);
 				log.info(`Assigned "${taxName}": ${slugs.join(", ")}`);
 			}
 		} catch (err) {
@@ -621,10 +599,10 @@ async function assignTaxonomies(
 export function emdashAutoMeta(config: EmdashAutoMetaConfig = {}): PluginDescriptor<EmdashAutoMetaConfig> {
 	return {
 		id: "emdash-auto-meta",
-		version: "1.3.0",
+		version: "1.4.0",
 		entrypoint: "emdash-auto-meta",
 		options: config,
-		capabilities: ["content:write"],
+		capabilities: ["content:write", "taxonomies:write"],
 	};
 }
 
@@ -635,8 +613,8 @@ export function createPlugin(options: EmdashAutoMetaConfig = {}): ResolvedPlugin
 
 	return definePlugin({
 		id: "emdash-auto-meta",
-		version: "1.3.0",
-		capabilities: ["content:write"],
+		version: "1.4.0",
+		capabilities: ["content:write", "taxonomies:write"],
 
 		hooks: {
 			"content:afterSave": {
@@ -697,7 +675,7 @@ export function createPlugin(options: EmdashAutoMetaConfig = {}): ResolvedPlugin
 					// taxonomies are always assigned even if the best-effort LLM steps
 					// get starved. (This was the regression: the Vision call ran first
 					// and the handler died before ever reaching taxonomy assignment.)
-					await assignTaxonomies(ev.collection, contentId, meta, cfg, log);
+					await assignTaxonomies(ctx, ev.collection, contentId, meta, cfg, log);
 
 					// ── Strip the meta block + set SEO (fast, no LLM) ─────────────
 					// Its own update so the authored comment is removed and SEO is set

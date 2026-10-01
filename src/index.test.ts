@@ -65,3 +65,63 @@ test("surfaces a parse error instead of silently no-oping on malformed JSON", ()
 	assert.match(result!.parseError!.message, /json/i);
 	assert.ok(result!.parseError!.raw.includes("not valid json"));
 });
+
+import { assignTaxonomies } from "./index.ts";
+
+type Term = { id: string; slug: string; taxonomy: string };
+
+function fakeCtx(initial: { terms: Term[]; entryTerms: string[] }) {
+	const terms = [...initial.terms];
+	const entry = new Set(initial.entryTerms);
+	let next = 0;
+	const calls: string[] = [];
+	const taxonomies = {
+		getTerms: async (taxonomy: string) => terms.filter((t) => t.taxonomy === taxonomy),
+		getEntryTerms: async (_c: string, _e: string, opts?: { taxonomy?: string }) =>
+			terms.filter((t) => entry.has(t.id) && (!opts?.taxonomy || t.taxonomy === opts.taxonomy)),
+		createTerm: async (taxonomy: string, input: { label: string; slug?: string }) => {
+			const t = { id: `new${++next}`, slug: input.slug ?? input.label, taxonomy };
+			terms.push(t);
+			calls.push(`create:${t.slug}`);
+			return t;
+		},
+		addEntryTerms: async (_c: string, _e: string, _tax: string, ids: string[]) => {
+			ids.forEach((i) => entry.add(i));
+			calls.push(`add:${ids.join(",")}`);
+			return [];
+		},
+		removeEntryTerms: async (_c: string, _e: string, _tax: string, ids: string[]) => {
+			ids.forEach((i) => entry.delete(i));
+			calls.push(`remove:${ids.join(",")}`);
+			return [];
+		},
+	};
+	return { ctx: { taxonomies, kv: {}, log: {} } as never, entry, calls };
+}
+
+const cfg = {
+	autoCreateTags: true,
+	taxonomyMap: { categories: "category", tags: "tag", regions: "region", eras: "era", counties: "county", cities: "city", people: "person", content_types: "content_type" },
+} as never;
+const log = { info() {}, warn() {}, error() {}, debug() {} } as never;
+
+test("assignTaxonomies replaces an entry's terms, creates missing auto-create terms, skips unknown strict terms", async () => {
+	const { ctx, entry, calls } = fakeCtx({
+		terms: [
+			{ id: "c1", slug: "news", taxonomy: "category" },
+			{ id: "c2", slug: "history", taxonomy: "category" },
+		],
+		entryTerms: ["c1"],
+	});
+	await assignTaxonomies(ctx, "posts", "p1", { categories: ["history", "nope"], tags: ["texas-history"] } as never, cfg, log);
+	assert.deepEqual([...entry].sort(), ["c2", "new1"]); // c1 removed, c2 + new tag added, "nope" skipped (not auto-created)
+	assert.ok(calls.includes("create:texas-history"));
+	assert.ok(calls.includes("remove:c1"));
+	assert.ok(!calls.some((c) => c.includes("nope")));
+});
+
+test("assignTaxonomies is a no-op when the meta block names no taxonomies", async () => {
+	const { ctx, calls } = fakeCtx({ terms: [], entryTerms: [] });
+	await assignTaxonomies(ctx, "posts", "p1", {} as never, cfg, log);
+	assert.deepEqual(calls, []);
+});
